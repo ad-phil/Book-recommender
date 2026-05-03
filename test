@@ -1,0 +1,230 @@
+# PAGE C: THE RESULTS GRID
+else:
+    st.markdown("<style>.stApp { background: white !important; }</style>", unsafe_allow_html=True)
+    if st.button("← Log Out"):
+        st.session_state.view = 'landing'
+        st.rerun()
+
+    st.title("📚 Your 10 Recommendations")
+    
+    # Mock Data
+    data = {"user_id": [101]*10, "isbn": ["9780141439518", "9780451524935", "9780307474278", "9780062315007", "9780743273565", "9780316769488", "9780446310789", "9780618260300", "9780553213119", "9780142437230"]}
+    df = pd.DataFrame(data)
+    
+    uid = int(st.session_state.user_id)
+    user_recs = df[df['user_id'] == uid].head(10)
+    
+    if not user_recs.empty:
+        books = fetch_all_book_data(user_recs['isbn'].tolist())
+        cols = st.columns(5)
+        for i, book in enumerate(books):
+            with cols[i % 5]:
+                st.image(book['cover'], use_container_width=True)
+                with st.expander("📖 Synopsis"):
+                    st.write(f"**{book['title']}**")
+                    st.write(book['summary'])
+    else:
+        st.warning("User ID not found.")
+
+
+
+
+
+import streamlit as st
+import requests
+import pandas as pd
+from concurrent.futures import ThreadPoolExecutor
+
+# --- 1. CONFIG & STATE ---
+st.set_page_config(page_title="BCU Lausanne", layout="wide", initial_sidebar_state="collapsed")
+
+if 'view' not in st.session_state:
+    st.session_state.view = 'landing'
+
+# URLs from the official BCU site
+LOGO_URL = "https://www.bcu-lausanne.ch/wp-content/themes/bcu/assets/images/logo-bcul.svg"
+WALLPAPER_URL = "https://images.unsplash.com/photo-1529154166925-574a0236a4f4?q=80&w=1548&auto=format&fit=crop&ixlib=rb-4.1.0&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D"
+# --- 2. THEME & REPAIR STYLING ---
+def apply_bcu_theme():
+    st.markdown(f"""
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap');
+
+        /* FORCE THE BACKGROUND - The !important is key here */
+        .stApp {{
+            background-image: linear-gradient(rgba(0, 0, 0, 0.4), rgba(0, 0, 0, 0.4)), url("{WALLPAPER_URL}") !important;
+            background-size: cover !important;
+            background-position: center !important;
+            background-attachment: fixed !important;
+            background-repeat: no-repeat !important;
+        }}
+
+        /* Clean up Streamlit's default headers and footers */
+        header, footer, [data-testid="stHeader"] {{
+            background: rgba(0,0,0,0) !important;
+        }}
+
+        /* White Top Utility Bar */
+        .utility-bar {{
+            display: flex; justify-content: flex-end; padding: 10px 50px;
+            background-color: white !important; color: #9e1041; font-size: 13px; gap: 20px;
+            position: fixed; top: 0; left: 0; right: 0; z-index: 1000;
+        }}
+
+        /* Logo - Moved down slightly so it's not cut off */
+        .logo-container {{
+            position: fixed; top: 0px; left: 60px; z-index: 1001; width: 230px;
+        }}
+        .logo-img {{ width: 100%; height: auto; display: block; }}
+
+        /* Navigation Bar - Burgundy */
+        .nav-bar {{
+            background-color: #9e1041 !important; 
+            padding: 15px 60px 15px 20px; /* Reduced left padding, kept right padding for breathing room */
+            display: flex; 
+            justify-content: flex-end; /* This aligns the items to the right */
+            gap: 50px; 
+            margin-top: 100px; 
+            color: white; 
+            font-weight: 500; 
+            font-size: 15px;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.2);
+        }}
+
+        /* Main Title */
+        .hero-title {{
+            font-size: 80px; font-weight: 700; color: white !important; 
+            margin: 120px 0 0 60px;
+            font-family: 'Inter', sans-serif;
+            text-shadow: 2px 2px 15px rgba(0,0,0,0.6);
+        }}
+
+        /* Information Box */
+        .info-box {{
+            background-color: rgba(158, 16, 65, 0.9) !important; padding: 35px;
+            border-radius: 4px; color: white !important; margin-top: 50px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            border-left: 6px solid white;
+        }}
+
+        /* Access Button */
+        div.stButton > button {{
+            background-color: #9e1041 !important; color: white !important;
+            border: 2px solid white !important; border-radius: 0px !important;
+            padding: 15px 30px !important; font-weight: bold; width: 100%;
+            margin-top: 10px;
+        }}
+        div.stButton > button:hover {{
+            background-color: white !important; color: #9e1041 !important;
+        }}
+        </style>
+
+        <div class="utility-bar">
+            <span>Payment</span> | <span>My Account</span> | <span>Contact</span> | <b>en</b>
+        </div>
+
+        <div class="logo-container">
+            <img src="{LOGO_URL}" class="logo-img">
+        </div>
+
+        <div class="nav-bar">
+            <span>Sites ⌵</span> <span>Services ⌵</span> <span>Online offers ⌵</span> 
+            <span>Collections</span> <span>About ⌵</span>
+        </div>
+    """, unsafe_allow_html=True)
+
+# --- 3. GOOGLE BOOKS API LOGIC ---
+GOOGLE_BOOKS_API = "https://www.googleapis.com/books/v1/volumes?q=isbn:"
+
+def get_book_details(isbn):
+    try:
+        response = requests.get(f"{GOOGLE_BOOKS_API}{isbn}", timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            if "items" in data:
+                info = data["items"][0]["volumeInfo"]
+                return {
+                    "title": info.get("title", "Unknown"),
+                    "cover": info.get("imageLinks", {}).get("thumbnail", "https://via.placeholder.com/150x200"),
+                    "summary": info.get("description", "No summary available.")
+                }
+    except: pass
+    return {"title": "Book not found", "cover": "https://via.placeholder.com/150x200", "summary": ""}
+
+@st.cache_data
+def fetch_all_book_data(isbn_list):
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        results = list(executor.map(get_book_details, isbn_list))
+    return results
+
+# --- 4. PAGE ROUTING ---
+if st.session_state.view == 'landing':
+    apply_bcu_theme()
+    st.markdown('<h1 class="hero-title">BCU Lausanne</h1>', unsafe_allow_html=True)
+    
+    _, _, col = st.columns([1, 1, 2])
+    with col:
+        st.markdown("""
+            <div class="info-box">
+                <h3 style="margin-top:0;">Recommandations Section</h3>
+                <p>Welcome to your numerical library. Access your 10 personalized recommendations.</p>
+            </div>
+        """, unsafe_allow_html=True)
+        if st.button("ACCESS MY RECOMMENDATIONS"):
+            st.session_state.view = 'recs'
+            st.rerun()
+
+else:
+    # RECOMMENDATION VIEW
+    # Force white background for readability
+    st.markdown("<style>.stApp { background: #f4f4f4 !important; }</style>", unsafe_allow_html=True)
+    
+    if st.button("← Back to welcome page"):
+        st.session_state.view = 'landing'
+        st.rerun()
+
+    st.title("📚 Your 10 Personalized Recommendations")
+    
+    # 1. Create the input
+    user_id = st.text_input("Please enter your User ID to load your books:")
+
+    # 2. This logic must be indented INSIDE the 'else' block
+    if user_id:
+        # Mock CSV data for 10 books
+        data = {
+            "user_id": [101]*10, 
+            "isbn": ["9780141439518", "9780451524935", "9780307474278", "9780062315007", 
+                     "9780743273565", "9780316769488", "9780446310789", "9780618260300", 
+                     "9780553213119", "9780142437230"]
+        }
+        df = pd.DataFrame(data)
+        
+        try:
+            uid_int = int(user_id)
+            # Filter for the user
+            user_recs = df[df['user_id'] == uid_int].head(10)
+            
+            if not user_recs.empty:
+                with st.spinner("Accessing catalog..."):
+                    books = fetch_all_book_data(user_recs['isbn'].tolist())
+                
+                # Create the Grid
+                cols = st.columns(5)
+                
+                for i, book in enumerate(books):
+                    with cols[i % 5]:
+                        st.markdown(f"""
+                            <div style="background: white; padding: 10px; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); min-height: 350px;">
+                                <img src="{book['cover']}" style="width:100%; height:200px; object-fit: cover; margin-bottom:10px;">
+                                <div style="font-weight:bold; color:#00305e; font-size:14px; height:50px; overflow:hidden;">{book['title']}</div>
+                            </div>
+                        """, unsafe_allow_html=True)
+                        
+                        with st.expander("📖 Synopsis"):
+                            st.write(book['summary'])
+            else:
+                st.warning("User ID not found in the database.")
+        except ValueError:
+            st.error("Please enter a numeric ID.")
+    else:
+        st.info("Enter your ID above to see your recommendations.")
