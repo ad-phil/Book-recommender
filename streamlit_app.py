@@ -118,7 +118,12 @@ def apply_full_page_style(background_url):
 GOOGLE_BOOKS_API = "https://www.googleapis.com/books/v1/volumes?q=isbn:"
 PLACEHOLDER_COVER = "https://via.placeholder.com/150x200?text=Cover+Not+Available"
 
-@st.cache_data
+if 'google_session' not in st.session_state:
+    st.session_state.google_session = requests.Session()
+if 'ol_session' not in st.session_state:
+    st.session_state.ol_session = requests.Session()
+
+@st.cache_data(show_spinner=False)
 def load_data_csv(file_path):
     if not os.path.exists(file_path):
         st.error(f"File not found: {file_path}. Please make sure it's in the same folder.")
@@ -130,7 +135,7 @@ def load_data_csv(file_path):
         return pd.DataFrame()
 
 
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def build_book_catalogs(items_df):
     id_to_metadata = {}
 
@@ -139,18 +144,15 @@ def build_book_catalogs(items_df):
 
     items_df.columns = items_df.columns.str.strip()
     
-    # Ensure column 'i' exists, if not fallback to the first column
     id_col = 'i' if 'i' in items_df.columns else items_df.columns[0]
 
     for _, row in items_df.iterrows():
-        # Clean the ID to string
         item_id = str(row[id_col]).strip()
         
         title = row.get('Title', 'Unknown Title')
         if pd.isna(title) or str(title).lower() == 'nan': 
             title = 'Unknown Title'
         else:
-            # Remove trailing spaces and slashes from the title
             title = str(title).rstrip(' /')
 
         author = row.get('Author', 'Unknown Author')
@@ -158,20 +160,14 @@ def build_book_catalogs(items_df):
             author = 'Unknown Author'
         else:
             author = str(author)
-            # 1. Remove the library dates (anything starting with a digit until the end)
             author = re.sub(r'\s*\d.*$', '', author)
-            # 2. Remove commas internally
             author = author.replace(',', '')
-            # 3. Clean up extra spaces
             author = " ".join(author.split())
-            # 4. THE FIX: Strip lingering punctuation (parentheses, hyphens, dots) from the very end
             author = author.rstrip(' (-.,)')
 
-        # Extract all ISBNs separated by semicolons for this specific book
         raw_isbns = row.get('ISBN Valid')
         valid_isbns = []
         if not pd.isna(raw_isbns) and str(raw_isbns).lower() != 'nan':
-            # Remove spaces and get pure numbers
             valid_isbns = [re.sub(r'\D', '', isbn) for isbn in str(raw_isbns).split(';') if re.sub(r'\D', '', isbn)]
 
         id_to_metadata[item_id] = {
@@ -184,7 +180,6 @@ def build_book_catalogs(items_df):
 
 
 def get_complete_book_info(item_id, id_to_metadata):
-    # Search locally using the book ID (column 'i')
     item_id = str(item_id).strip()
     
     if item_id not in id_to_metadata:
@@ -200,45 +195,37 @@ def get_complete_book_info(item_id, id_to_metadata):
         "item_id": item_id
     }
 
-    # 1. TRY GOOGLE BOOKS FIRST (For Cover and Summary)
     for isbn in meta['isbns']:
         try:
-            response = requests.get(f"{GOOGLE_BOOKS_API}{isbn}", timeout=4)
+            response = st.session_state.google_session.get(f"{GOOGLE_BOOKS_API}{isbn}", timeout=3)
             if response.status_code == 200:
                 data = response.json()
                 if "items" in data and len(data["items"]) > 0:
                     info = data["items"][0]["volumeInfo"]
                     
-                    # Grab Google cover if we don't have one yet
                     if book_data["cover"] == PLACEHOLDER_COVER:
                         g_cover = info.get("imageLinks", {}).get("thumbnail")
                         if g_cover:
-                            # Upgrade to https to prevent browser security blocks
                             book_data["cover"] = g_cover.replace("http:", "https:")
 
-                    # Grab Google summary if we don't have one yet
                     if book_data["summary"] == "No summary available.":
                         g_summary = info.get("description")
                         if g_summary:
                             book_data["summary"] = g_summary
                     
-                    # If we found BOTH, we can stop searching Google early
                     if book_data["cover"] != PLACEHOLDER_COVER and book_data["summary"] != "No summary available.":
                         break
         except:
             pass 
             
-    # 2. SECOND CHANCE: OPEN LIBRARY (If Google failed to find a cover)
     if book_data["cover"] == PLACEHOLDER_COVER:
         for isbn in meta['isbns']:
-            # ?default=false makes the API return a 404 error if it doesn't have the cover
             open_library_url = f"https://covers.openlibrary.org/b/isbn/{isbn}-L.jpg?default=false"
             try:
-                # We use a fast "HEAD" request just to check if the image exists
-                ol_response = requests.head(open_library_url, timeout=3, allow_redirects=True)
+                ol_response = st.session_state.ol_session.head(open_library_url, timeout=2, allow_redirects=True)
                 if ol_response.status_code == 200:
                     book_data["cover"] = open_library_url
-                    break # Found a cover on Open Library! Stop checking.
+                    break 
             except:
                 pass
 
@@ -252,12 +239,11 @@ def get_user_zero_fallback_blocks(recommendations_df):
     if zero_recs.empty:
         return []
     
-    # We join spaces and split spaces to get a list of fallback Book IDs
     raw_id_data = " ".join(zero_recs['isbn'].astype(str).tolist())
     return [block.strip() for block in raw_id_data.split() if block.strip()]
 
 
-@st.cache_data
+@st.cache_data(show_spinner=False)
 def fetch_book_data_v2(item_id_blocks, id_to_metadata, fallback_blocks=None): 
     books_results = []
     fallback_blocks = fallback_blocks or []
@@ -265,7 +251,6 @@ def fetch_book_data_v2(item_id_blocks, id_to_metadata, fallback_blocks=None):
     seen_ids = set()
 
     for block in item_id_blocks:
-        # Just in case you still have semicolons separating alternative IDs in recommendations.csv
         ids_for_this_book = [i.strip() for i in block.split(';') if i.strip()]
         details = None
         
@@ -277,7 +262,6 @@ def fetch_book_data_v2(item_id_blocks, id_to_metadata, fallback_blocks=None):
                     details = temp_details
                     break
                 
-        # Fallback logic
         if details is None and fallback_blocks:
             while fallback_index < len(fallback_blocks):
                 fallback_block = fallback_blocks[fallback_index]
@@ -295,7 +279,6 @@ def fetch_book_data_v2(item_id_blocks, id_to_metadata, fallback_blocks=None):
                 if details is not None:
                     break
 
-        # If completely missing
         if details is None:
             first_id = ids_for_this_book[0] if ids_for_this_book else "Unknown"
             details = {
@@ -310,9 +293,79 @@ def fetch_book_data_v2(item_id_blocks, id_to_metadata, fallback_blocks=None):
         if "item_id" in details:
             seen_ids.add(details["item_id"])
             
-        time.sleep(0.2)
+        time.sleep(0.1) 
         
     return books_results
+
+# --- HELPER: UI RENDERING FOR BOOK CARD ---
+def render_book_card(book, rank):
+    st.markdown(f'<div class="book-title-box">{book["title"]}</div>', unsafe_allow_html=True)
+    
+    # Updated Badge Color to match the old title box (#dedbd0)
+    badge_html = f'<div style="position: absolute; top: -15px; left: -15px; background-color: #dedbd0; color: {BURGUNDY}; width: 35px; height: 35px; border-radius: 50%; display: flex; justify-content: center; align-items: center; font-weight: 900; font-size: 18px; box-shadow: 0 4px 8px rgba(0,0,0,0.3); z-index: 10; border: 2px solid white;">{rank}</div>'
+
+    if book['cover'] == PLACEHOLDER_COVER:
+        html_cover = f"""
+<div style="height: 220px; width: 100%; background-color: #9e1041; border-radius: 4px 12px 12px 4px; box-shadow: inset 4px 0 10px rgba(0,0,0,0.2), 0 4px 8px rgba(0,0,0,0.15); display: flex; flex-direction: column; justify-content: center; align-items: center; padding: 15px; margin-bottom: 10px; text-align: center; position: relative; border-left: 5px solid #7a0c32;">
+{badge_html}
+<div style="color: white; font-weight: bold; font-size: 14px; margin-bottom: 10px; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden;">{book['title']}</div>
+<div style="color: #e0e0e0; font-size: 12px; font-style: italic;">{book['author']}</div>
+<div style="position: absolute; bottom: 10px; right: 10px; opacity: 0.3;">
+<svg width="24" height="24" viewBox="0 0 24 24" fill="white"><path d="M4 19v-14c0-1.1.9-2 2-2h12c1.1 0 2 .9 2 2v14l-4-2-4 2-4-2-4 2zm2-14v11.5l2-1 2 1 2-1 2 1 2-1 2 1v-11.5h-12z"/></svg>
+</div>
+</div>
+"""
+        st.markdown(html_cover, unsafe_allow_html=True)
+    else:
+        html_cover = f"""
+<div style="height: 220px; position: relative; display: flex; justify-content: center; align-items: center; margin-bottom: 10px;">
+{badge_html}
+<img src="{book['cover']}" style="max-height: 100%; max-width: 100%; object-fit: contain; box-shadow: 0 4px 8px rgba(0,0,0,0.15);">
+</div>
+"""
+        st.markdown(html_cover, unsafe_allow_html=True)
+        
+    st.markdown(f'<div class="book-author-box"> {book.get("author", "Unknown Author")}</div>', unsafe_allow_html=True)
+    with st.expander("Book summary"):
+        st.write(book['summary'])
+
+# --- HELPER: NETFLIX ROW RENDERER ---
+def display_netflix_row(title, books, row_key):
+    if not books:
+        return
+    
+    st.markdown(f"""
+        <div style="background-color: rgba(158, 16, 65, 0.9); padding: 10px 20px; border-radius: 4px; margin-top: 30px; margin-bottom: 20px; border-left: 6px solid white;">
+            <h3 style='color: white; margin: 0;'>{title}</h3>
+        </div>
+    """, unsafe_allow_html=True)
+    
+    if f'page_{row_key}' not in st.session_state:
+        st.session_state[f'page_{row_key}'] = 0
+        
+    page = st.session_state[f'page_{row_key}']
+    
+    start_idx = page * 5
+    end_idx = start_idx + 5
+    visible_books = books[start_idx:end_idx]
+    
+    cols = st.columns([1, 1, 1, 1, 1, 0.4])
+    
+    for col_idx, book in enumerate(visible_books):
+        absolute_rank = start_idx + col_idx + 1
+        with cols[col_idx]:
+            render_book_card(book, absolute_rank)
+            
+    with cols[5]:
+        st.markdown("<div style='height: 140px;'></div>", unsafe_allow_html=True) 
+        if page == 0 and len(books) > 5:
+            if st.button("➔", key=f"next_{row_key}", use_container_width=True):
+                st.session_state[f'page_{row_key}'] = 1
+                st.rerun()
+        elif page == 1:
+            if st.button("⬅", key=f"prev_{row_key}", use_container_width=True):
+                st.session_state[f'page_{row_key}'] = 0
+                st.rerun()
 
 # --- 4. PAGE ROUTING ---
 
@@ -428,15 +481,7 @@ else:
         st.rerun()
 
     with st.container(border=False):
-        st.markdown(f"""
-            <div style="
-                background-color: #dedbd0; padding: 25px; border-radius: 4px;
-                margin-bottom: 20px; font-family: 'Inter', sans-serif;
-            ">
-                <h1 style="margin-top:0; color:#9e1041;"> Recommendations for ID: {st.session_state.user_id}</h1>
-                <p style="color: #555555; font-size:18px; margin-bottom:0;">Based on your library activity, here are your top picks:</p>
-            </div>
-        """, unsafe_allow_html=True)
+        # Removed the Recommendations ID header block here
         
         with st.spinner("Loading library catalogs..."):
             recs_df = load_data_csv("recommendations_2.csv")
@@ -450,79 +495,41 @@ else:
                 st.warning("No recommendation data loaded.")
                 st.stop()
             
-            # Map column 'i' to the metadata
             id_to_metadata = build_book_catalogs(items_df)
         
         uid_entered = str(st.session_state.user_id).strip()
-        user_recs = recs_df[recs_df['user_id'] == uid_entered]
         
-        if not user_recs.empty:
-            with st.spinner("Loading your books from the library..."):
-                
-                # These are now BOOK IDs, not ISBNs
-                raw_id_data = " ".join(user_recs['isbn'].astype(str).tolist())
-                all_book_blocks = [block.strip() for block in raw_id_data.split() if block.strip()]
-                
-                unique_blocks = []
-                seen_blocks = set()
-                for block in all_book_blocks:
-                    if block not in seen_blocks:
-                        seen_blocks.add(block)
-                        unique_blocks.append(block)
-                
-                book_blocks = unique_blocks[:10]
-                fallback_blocks = get_user_zero_fallback_blocks(recs_df)
-                
-                # Fetch books by ID instead of ISBN
-                books = fetch_book_data_v2(
-                    book_blocks, 
-                    id_to_metadata, 
-                    fallback_blocks=fallback_blocks
-                ) 
-            
-                for row_idx in range(0, len(books), 5):
-                    row_books = books[row_idx:row_idx+5]
-                    cols = st.columns(5) 
-                    
-                    for col_idx, book in enumerate(row_books):
-                        with cols[col_idx]:
-                            # 1. The Title Box
-                            st.markdown(f'<div class="book-title-box">{book["title"]}</div>', unsafe_allow_html=True)
-                            
-                            # 2. THE COVER (Image OR Virtual Cover)
-                            if book['cover'] == PLACEHOLDER_COVER:
-                                # Generate a beautiful virtual cover using CSS and the BCU Burgundy color
-                                st.markdown(f"""
-                                    <div style="height: 220px; width: 100%; background-color: #9e1041; 
-                                                border-radius: 4px 12px 12px 4px; box-shadow: inset 4px 0 10px rgba(0,0,0,0.2), 0 4px 8px rgba(0,0,0,0.15); 
-                                                display: flex; flex-direction: column; justify-content: center; align-items: center; 
-                                                padding: 15px; margin-bottom: 10px; text-align: center; position: relative;
-                                                border-left: 5px solid #7a0c32;">
-                                        <div style="color: white; font-weight: bold; font-size: 14px; margin-bottom: 10px; 
-                                                    display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden;">
-                                            {book['title']}
-                                        </div>
-                                        <div style="color: #e0e0e0; font-size: 12px; font-style: italic;">
-                                            {book['author']}
-                                        </div>
-                                        <div style="position: absolute; bottom: 10px; right: 10px; opacity: 0.3;">
-                                            <svg width="24" height="24" viewBox="0 0 24 24" fill="white"><path d="M4 19v-14c0-1.1.9-2 2-2h12c1.1 0 2 .9 2 2v14l-4-2-4 2-4-2-4 2zm2-14v11.5l2-1 2 1 2-1 2 1 2-1 2 1v-11.5h-12z"/></svg>
-                                        </div>
-                                    </div>
-                                """, unsafe_allow_html=True)
-                            else:
-                                # Use the real image found from Google or Open Library
-                                st.markdown(f"""
-                                    <div style="height: 220px; display: flex; justify-content: center; align-items: center; margin-bottom: 10px;">
-                                        <img src="{book['cover']}" style="max-height: 100%; max-width: 100%; object-fit: contain; box-shadow: 0 4px 8px rgba(0,0,0,0.15);">
-                                    </div>
-                                """, unsafe_allow_html=True)
-                            
-                            # 3. The Author Box
-                            st.markdown(f'<div class="book-author-box"> {book.get("author", "Unknown Author")}</div>', unsafe_allow_html=True)
-                            
-                            # 4. The Summary Expander
-                            with st.expander("Book summary"):
-                                st.write(book['summary'])
+        user_recs = recs_df[recs_df['user_id'] == uid_entered]
+        new_recs = recs_df[recs_df['user_id'] == 'new']
+        fallback_blocks = get_user_zero_fallback_blocks(recs_df)
+
+        def extract_top_10_blocks(df_subset):
+            if df_subset.empty: return []
+            raw_id_data = " ".join(df_subset['isbn'].astype(str).tolist())
+            all_blocks = [block.strip() for block in raw_id_data.split() if block.strip()]
+            unique_blocks = []
+            seen = set()
+            for b in all_blocks:
+                if b not in seen:
+                    seen.add(b)
+                    unique_blocks.append(b)
+            return unique_blocks[:10]
+
+        user_blocks = extract_top_10_blocks(user_recs)
+        new_blocks = extract_top_10_blocks(new_recs)
+        
+        if not user_blocks and uid_entered != 'new':
+            st.warning("Your user ID doesn't exist. Please type 'new' to see our general recommendations.")
         else:
-            st.warning(f"Your user ID don't exist, if you are a new user please type 'new' to see our general recommendations")
+            with st.spinner("Loading your books from the library..."):
+                books_user = fetch_book_data_v2(user_blocks, id_to_metadata, fallback_blocks=fallback_blocks) if user_blocks else []
+                books_new = fetch_book_data_v2(new_blocks, id_to_metadata, fallback_blocks=fallback_blocks) if new_blocks else []
+                
+                # --- RENDER ROW 1 (Personal Recommendations) ---
+                if books_user:
+                    row_title = "Trending Picks" if uid_entered == 'new' else f"Recommended for You"
+                    display_netflix_row(row_title, books_user, "user_row")
+                
+                # --- RENDER ROW 2 (Top 10 / 'new' user recommendations) ---
+                if books_new and uid_entered != 'new':
+                    display_netflix_row("Top 10 Library Recommendations", books_new, "new_row")
