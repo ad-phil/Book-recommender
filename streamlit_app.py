@@ -607,3 +607,5 @@ else:
                 # --- RENDER ROW 2 (Top 10 / 'new' user recommendations) ---
                 if books_new and uid_entered != 'new':
                     display_netflix_row("Top 10 Library Recommendations", books_new, "new_row")
+
+st.write("🕵️ Debug Mode - Is the API Key Loaded?:", "GOOGLE_BOOKS_API_KEY" in st.secrets)
