@@ -192,7 +192,6 @@ def get_complete_book_info(item_id, id_to_metadata, http_session):
         "item_id": item_id
     }
 
-    # THE VIP PASS: Check if we have an API key in Streamlit Secrets
     api_key_param = ""
     if "GOOGLE_BOOKS_API_KEY" in st.secrets:
         api_key_param = f"&key={st.secrets['GOOGLE_BOOKS_API_KEY']}"
@@ -200,7 +199,6 @@ def get_complete_book_info(item_id, id_to_metadata, http_session):
     # 1. TRY GOOGLE BOOKS FIRST (BY EXACT ISBN)
     for isbn in meta['isbns']:
         try:
-            # Attach the API key to the request
             url = f"{GOOGLE_BOOKS_API}{isbn}{api_key_param}"
             response = http_session.get(url, timeout=5)
             
@@ -221,10 +219,13 @@ def get_complete_book_info(item_id, id_to_metadata, http_session):
                     
                     if book_data["cover"] != PLACEHOLDER_COVER and book_data["summary"] != "No summary available.":
                         break
-        except:
+            else:
+                # DEBUG LINE: Print exactly why Google rejected it
+                st.error(f"Google API Error (ISBN): {response.status_code} - {response.text}")
+        except Exception as e:
             pass 
 
-    # 2. THE NEW TRICK: TRY GOOGLE BOOKS BY TITLE + AUTHOR
+    # 2. TRY GOOGLE BOOKS BY TITLE + AUTHOR
     if book_data["summary"] == "No summary available." or book_data["cover"] == PLACEHOLDER_COVER:
         try:
             import urllib.parse
@@ -248,10 +249,13 @@ def get_complete_book_info(item_id, id_to_metadata, http_session):
                         g_summary = info.get("description")
                         if g_summary:
                             book_data["summary"] = g_summary
-        except:
+            else:
+                 # DEBUG LINE: Print exactly why Google rejected it
+                 st.error(f"Google API Error (Title): {response.status_code} - {response.text}")
+        except Exception as e:
             pass
             
-    # 3. SECOND CHANCE: OPEN LIBRARY (For Cover AND Summary)
+    # 3. SECOND CHANCE: OPEN LIBRARY
     if book_data["cover"] == PLACEHOLDER_COVER or book_data["summary"] == "No summary available.":
         for isbn in meta['isbns']:
             if book_data["cover"] == PLACEHOLDER_COVER:
@@ -285,7 +289,6 @@ def get_complete_book_info(item_id, id_to_metadata, http_session):
                 break
 
     return book_data
-
 
 def get_user_zero_fallback_blocks(recommendations_df):
     if 'user_id' not in recommendations_df.columns or 'isbn' not in recommendations_df.columns:
@@ -607,5 +610,3 @@ else:
                 # --- RENDER ROW 2 (Top 10 / 'new' user recommendations) ---
                 if books_new and uid_entered != 'new':
                     display_netflix_row("Top 10 Library Recommendations", books_new, "new_row")
-
-st.write("🕵️ Debug Mode - Is the API Key Loaded?:", "GOOGLE_BOOKS_API_KEY" in st.secrets)
