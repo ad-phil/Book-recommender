@@ -190,11 +190,18 @@ def get_complete_book_info(item_id, id_to_metadata, http_session):
         "item_id": item_id
     }
 
-    # 1. TRY GOOGLE BOOKS FIRST
+    # THE VIP PASS: Check if we have an API key in Streamlit Secrets
+    api_key_param = ""
+    if "GOOGLE_BOOKS_API_KEY" in st.secrets:
+        api_key_param = f"&key={st.secrets['GOOGLE_BOOKS_API_KEY']}"
+
+    # 1. TRY GOOGLE BOOKS FIRST (BY EXACT ISBN)
     for isbn in meta['isbns']:
         try:
-            # Cloud timeout increased to 5s
-            response = http_session.get(f"{GOOGLE_BOOKS_API}{isbn}", timeout=5)
+            # Attach the API key to the request
+            url = f"{GOOGLE_BOOKS_API}{isbn}{api_key_param}"
+            response = http_session.get(url, timeout=5)
+            
             if response.status_code == 200:
                 data = response.json()
                 if "items" in data and len(data["items"]) > 0:
@@ -214,23 +221,46 @@ def get_complete_book_info(item_id, id_to_metadata, http_session):
                         break
         except:
             pass 
+
+    # 2. THE NEW TRICK: TRY GOOGLE BOOKS BY TITLE + AUTHOR
+    if book_data["summary"] == "No summary available." or book_data["cover"] == PLACEHOLDER_COVER:
+        try:
+            import urllib.parse
+            safe_title = urllib.parse.quote_plus(book_data['title'])
+            safe_author = urllib.parse.quote_plus(book_data['author'])
             
-    # 2. SECOND CHANCE: OPEN LIBRARY (For Cover AND Summary)
+            fallback_url = f"https://www.googleapis.com/books/v1/volumes?q=intitle:{safe_title}+inauthor:{safe_author}{api_key_param}"
+            response = http_session.get(fallback_url, timeout=5)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if "items" in data and len(data["items"]) > 0:
+                    info = data["items"][0]["volumeInfo"]
+                    
+                    if book_data["cover"] == PLACEHOLDER_COVER:
+                        g_cover = info.get("imageLinks", {}).get("thumbnail")
+                        if g_cover:
+                            book_data["cover"] = g_cover.replace("http:", "https:")
+
+                    if book_data["summary"] == "No summary available.":
+                        g_summary = info.get("description")
+                        if g_summary:
+                            book_data["summary"] = g_summary
+        except:
+            pass
+            
+    # 3. SECOND CHANCE: OPEN LIBRARY (For Cover AND Summary)
     if book_data["cover"] == PLACEHOLDER_COVER or book_data["summary"] == "No summary available.":
         for isbn in meta['isbns']:
-            
-            # Try getting the cover
             if book_data["cover"] == PLACEHOLDER_COVER:
                 open_library_cover = f"https://covers.openlibrary.org/b/isbn/{isbn}-L.jpg?default=false"
                 try:
-                    # Some clouds block HEAD requests, switched to GET with stream=True for safety
                     ol_response = http_session.get(open_library_cover, timeout=3, allow_redirects=True, stream=True)
                     if ol_response.status_code == 200:
                         book_data["cover"] = open_library_cover
                 except:
                     pass
 
-            # Try getting the text summary
             if book_data["summary"] == "No summary available.":
                 open_library_data = f"https://openlibrary.org/api/books?bibkeys=ISBN:{isbn}&jscmd=details&format=json"
                 try:
