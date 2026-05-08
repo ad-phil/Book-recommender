@@ -299,9 +299,17 @@ def fetch_book_data_v2(item_id_blocks, id_to_metadata, fallback_blocks=None):
 
 # --- HELPER: UI RENDERING FOR BOOK CARD ---
 def render_book_card(book, rank):
-    st.markdown(f'<div class="book-title-box">{book["title"]}</div>', unsafe_allow_html=True)
     
-    # Updated Badge Color to match the old title box (#dedbd0)
+    # THE FIX: Dynamic character count for font-size optimization
+    t_len = len(book["title"])
+    if t_len < 35: fs = "16px"
+    elif t_len < 60: fs = "14px"
+    elif t_len < 85: fs = "12px"
+    else: fs = "11px"
+    
+    # Injected dynamic font size to the title box
+    st.markdown(f'<div class="book-title-box" style="font-size: {fs};">{book["title"]}</div>', unsafe_allow_html=True)
+    
     badge_html = f'<div style="position: absolute; top: -15px; left: -15px; background-color: #dedbd0; color: {BURGUNDY}; width: 35px; height: 35px; border-radius: 50%; display: flex; justify-content: center; align-items: center; font-weight: 900; font-size: 18px; box-shadow: 0 4px 8px rgba(0,0,0,0.3); z-index: 10; border: 2px solid white;">{rank}</div>'
 
     if book['cover'] == PLACEHOLDER_COVER:
