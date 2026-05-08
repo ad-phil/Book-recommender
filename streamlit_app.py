@@ -118,11 +118,6 @@ def apply_full_page_style(background_url):
 GOOGLE_BOOKS_API = "https://www.googleapis.com/books/v1/volumes?q=isbn:"
 PLACEHOLDER_COVER = "https://via.placeholder.com/150x200?text=Cover+Not+Available"
 
-if 'google_session' not in st.session_state:
-    st.session_state.google_session = requests.Session()
-if 'ol_session' not in st.session_state:
-    st.session_state.ol_session = requests.Session()
-
 @st.cache_data(show_spinner=False)
 def load_data_csv(file_path):
     if not os.path.exists(file_path):
@@ -179,7 +174,7 @@ def build_book_catalogs(items_df):
     return id_to_metadata
 
 
-def get_complete_book_info(item_id, id_to_metadata):
+def get_complete_book_info(item_id, id_to_metadata, http_session):
     item_id = str(item_id).strip()
     
     if item_id not in id_to_metadata:
@@ -195,9 +190,10 @@ def get_complete_book_info(item_id, id_to_metadata):
         "item_id": item_id
     }
 
+    # 1. TRY GOOGLE BOOKS FIRST
     for isbn in meta['isbns']:
         try:
-            response = st.session_state.google_session.get(f"{GOOGLE_BOOKS_API}{isbn}", timeout=3)
+            response = http_session.get(f"{GOOGLE_BOOKS_API}{isbn}", timeout=4)
             if response.status_code == 200:
                 data = response.json()
                 if "items" in data and len(data["items"]) > 0:
@@ -218,16 +214,42 @@ def get_complete_book_info(item_id, id_to_metadata):
         except:
             pass 
             
-    if book_data["cover"] == PLACEHOLDER_COVER:
+    # 2. SECOND CHANCE: OPEN LIBRARY (For Cover AND Summary)
+    if book_data["cover"] == PLACEHOLDER_COVER or book_data["summary"] == "No summary available.":
         for isbn in meta['isbns']:
-            open_library_url = f"https://covers.openlibrary.org/b/isbn/{isbn}-L.jpg?default=false"
-            try:
-                ol_response = st.session_state.ol_session.head(open_library_url, timeout=2, allow_redirects=True)
-                if ol_response.status_code == 200:
-                    book_data["cover"] = open_library_url
-                    break 
-            except:
-                pass
+            
+            # Try getting the cover
+            if book_data["cover"] == PLACEHOLDER_COVER:
+                open_library_cover = f"https://covers.openlibrary.org/b/isbn/{isbn}-L.jpg?default=false"
+                try:
+                    ol_response = http_session.head(open_library_cover, timeout=2, allow_redirects=True)
+                    if ol_response.status_code == 200:
+                        book_data["cover"] = open_library_cover
+                except:
+                    pass
+
+            # Try getting the text summary
+            if book_data["summary"] == "No summary available.":
+                open_library_data = f"https://openlibrary.org/api/books?bibkeys=ISBN:{isbn}&jscmd=details&format=json"
+                try:
+                    ol_desc_response = http_session.get(open_library_data, timeout=3)
+                    if ol_desc_response.status_code == 200:
+                        ol_json = ol_desc_response.json()
+                        key = f"ISBN:{isbn}"
+                        if key in ol_json and "details" in ol_json[key]:
+                            details = ol_json[key]["details"]
+                            if "description" in details:
+                                desc = details["description"]
+                                # Open Library sometimes formats descriptions as a dictionary, sometimes as a string
+                                if isinstance(desc, dict) and "value" in desc:
+                                    book_data["summary"] = desc["value"]
+                                elif isinstance(desc, str):
+                                    book_data["summary"] = desc
+                except:
+                    pass
+            
+            if book_data["cover"] != PLACEHOLDER_COVER and book_data["summary"] != "No summary available.":
+                break
 
     return book_data
 
@@ -244,23 +266,27 @@ def get_user_zero_fallback_blocks(recommendations_df):
 
 
 @st.cache_data(show_spinner=False)
-def fetch_book_data_v2(item_id_blocks, id_to_metadata, fallback_blocks=None): 
+def fetch_book_data_v2(item_id_blocks, _id_to_metadata, fallback_blocks=None): 
     books_results = []
     fallback_blocks = fallback_blocks or []
     fallback_index = 0
     seen_ids = set()
+    
+    # Safely instantiating the session INSIDE the function so it doesn't break Streamlit deployments
+    http_session = requests.Session()
 
     for block in item_id_blocks:
         ids_for_this_book = [i.strip() for i in block.split(';') if i.strip()]
         details = None
         
         for item_id in ids_for_this_book:
-            temp_details = get_complete_book_info(item_id, id_to_metadata)
+            details = get_complete_book_info(item_id, _id_to_metadata, http_session)
             
-            if temp_details is not None:
-                if temp_details["item_id"] not in seen_ids:
-                    details = temp_details
+            if details is not None:
+                if details["item_id"] not in seen_ids:
                     break
+                else:
+                    details = None
                 
         if details is None and fallback_blocks:
             while fallback_index < len(fallback_blocks):
@@ -269,7 +295,7 @@ def fetch_book_data_v2(item_id_blocks, id_to_metadata, fallback_blocks=None):
                 
                 fallback_ids_for_this_book = [i.strip() for i in fallback_block.split(';') if i.strip()]
                 for f_id in fallback_ids_for_this_book:
-                    temp_fallback_details = get_complete_book_info(f_id, id_to_metadata)
+                    temp_fallback_details = get_complete_book_info(f_id, _id_to_metadata, http_session)
                     
                     if temp_fallback_details is not None:
                         if temp_fallback_details["item_id"] not in seen_ids:
@@ -293,21 +319,20 @@ def fetch_book_data_v2(item_id_blocks, id_to_metadata, fallback_blocks=None):
         if "item_id" in details:
             seen_ids.add(details["item_id"])
             
-        time.sleep(0.1) 
+        # Slightly increased to protect your deployed link from Google bans
+        time.sleep(0.3) 
         
     return books_results
 
 # --- HELPER: UI RENDERING FOR BOOK CARD ---
 def render_book_card(book, rank):
     
-    # THE FIX: Dynamic character count for font-size optimization
     t_len = len(book["title"])
     if t_len < 35: fs = "16px"
     elif t_len < 60: fs = "14px"
     elif t_len < 85: fs = "12px"
     else: fs = "11px"
     
-    # Injected dynamic font size to the title box
     st.markdown(f'<div class="book-title-box" style="font-size: {fs};">{book["title"]}</div>', unsafe_allow_html=True)
     
     badge_html = f'<div style="position: absolute; top: -15px; left: -15px; background-color: #dedbd0; color: {BURGUNDY}; width: 35px; height: 35px; border-radius: 50%; display: flex; justify-content: center; align-items: center; font-weight: 900; font-size: 18px; box-shadow: 0 4px 8px rgba(0,0,0,0.3); z-index: 10; border: 2px solid white;">{rank}</div>'
@@ -466,11 +491,12 @@ else:
 
         .stExpander { background-color: #ffffff !important; border: 1px solid #cccccc !important; }
         
+        /* THE CSS FIX for the Top Margin on Titles */
         .book-title-box {
             background-color: rgba(158, 16, 65, 1) !important; color: white !important;
-            padding: 10px; border: 1px solid #e0e0e0; border-radius: 6px; text-align: center;
-            font-weight: bold; font-size: 16px; margin-bottom: 10px; 
-            height: 70px; display: flex; align-items: center; justify-content: center;
+            padding: 15px 10px 5px 10px; border: 1px solid #e0e0e0; border-radius: 6px; text-align: center;
+            font-weight: bold; margin-bottom: 10px; 
+            height: 75px; display: flex; align-items: flex-start; justify-content: center;
             box-shadow: 0 2px 5px rgba(0,0,0,0.05); overflow: hidden;
         }
         
@@ -489,8 +515,6 @@ else:
         st.rerun()
 
     with st.container(border=False):
-        # Removed the Recommendations ID header block here
-        
         with st.spinner("Loading library catalogs..."):
             recs_df = load_data_csv("recommendations_2.csv")
             items_df = load_data_csv("items.csv") 
