@@ -4,6 +4,8 @@ import pandas as pd
 import re
 import time
 import os
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # --- 1. CONFIG & STATE ---
 st.set_page_config(page_title="BCU Lausanne", layout="wide", initial_sidebar_state="collapsed")
@@ -303,12 +305,19 @@ def fetch_book_data_v2(item_id_blocks, _id_to_metadata, fallback_blocks=None):
     fallback_index = 0
     seen_ids = set()
     
+    # --- THE ULTIMATE CLOUD SESSION ---
     http_session = requests.Session()
-    # THE BOT DISGUISE: Tells the APIs we are a normal Google Chrome browser
     http_session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*"
     })
+    
+    # If the server drops us, automatically wait and try again 3 times!
+    retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retries)
+    http_session.mount('http://', adapter)
+    http_session.mount('https://', adapter)
+    # ----------------------------------
 
     for block in item_id_blocks:
         ids_for_this_book = [i.strip() for i in block.split(';') if i.strip()]
@@ -357,7 +366,6 @@ def fetch_book_data_v2(item_id_blocks, _id_to_metadata, fallback_blocks=None):
         time.sleep(0.3) 
         
     return books_results
-
 # --- HELPER: UI RENDERING FOR BOOK CARD ---
 def render_book_card(book, rank):
     
