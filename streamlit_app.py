@@ -193,7 +193,8 @@ def get_complete_book_info(item_id, id_to_metadata, http_session):
     # 1. TRY GOOGLE BOOKS FIRST
     for isbn in meta['isbns']:
         try:
-            response = http_session.get(f"{GOOGLE_BOOKS_API}{isbn}", timeout=4)
+            # Cloud timeout increased to 5s
+            response = http_session.get(f"{GOOGLE_BOOKS_API}{isbn}", timeout=5)
             if response.status_code == 200:
                 data = response.json()
                 if "items" in data and len(data["items"]) > 0:
@@ -222,7 +223,8 @@ def get_complete_book_info(item_id, id_to_metadata, http_session):
             if book_data["cover"] == PLACEHOLDER_COVER:
                 open_library_cover = f"https://covers.openlibrary.org/b/isbn/{isbn}-L.jpg?default=false"
                 try:
-                    ol_response = http_session.head(open_library_cover, timeout=2, allow_redirects=True)
+                    # Some clouds block HEAD requests, switched to GET with stream=True for safety
+                    ol_response = http_session.get(open_library_cover, timeout=3, allow_redirects=True, stream=True)
                     if ol_response.status_code == 200:
                         book_data["cover"] = open_library_cover
                 except:
@@ -232,7 +234,7 @@ def get_complete_book_info(item_id, id_to_metadata, http_session):
             if book_data["summary"] == "No summary available.":
                 open_library_data = f"https://openlibrary.org/api/books?bibkeys=ISBN:{isbn}&jscmd=details&format=json"
                 try:
-                    ol_desc_response = http_session.get(open_library_data, timeout=3)
+                    ol_desc_response = http_session.get(open_library_data, timeout=4)
                     if ol_desc_response.status_code == 200:
                         ol_json = ol_desc_response.json()
                         key = f"ISBN:{isbn}"
@@ -240,7 +242,6 @@ def get_complete_book_info(item_id, id_to_metadata, http_session):
                             details = ol_json[key]["details"]
                             if "description" in details:
                                 desc = details["description"]
-                                # Open Library sometimes formats descriptions as a dictionary, sometimes as a string
                                 if isinstance(desc, dict) and "value" in desc:
                                     book_data["summary"] = desc["value"]
                                 elif isinstance(desc, str):
@@ -272,8 +273,12 @@ def fetch_book_data_v2(item_id_blocks, _id_to_metadata, fallback_blocks=None):
     fallback_index = 0
     seen_ids = set()
     
-    # Safely instantiating the session INSIDE the function so it doesn't break Streamlit deployments
     http_session = requests.Session()
+    # THE BOT DISGUISE: Tells the APIs we are a normal Google Chrome browser
+    http_session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*"
+    })
 
     for block in item_id_blocks:
         ids_for_this_book = [i.strip() for i in block.split(';') if i.strip()]
@@ -319,7 +324,6 @@ def fetch_book_data_v2(item_id_blocks, _id_to_metadata, fallback_blocks=None):
         if "item_id" in details:
             seen_ids.add(details["item_id"])
             
-        # Slightly increased to protect your deployed link from Google bans
         time.sleep(0.3) 
         
     return books_results
