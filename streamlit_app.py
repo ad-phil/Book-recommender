@@ -192,14 +192,19 @@ def get_complete_book_info(item_id, id_to_metadata, http_session):
         "item_id": item_id
     }
 
+    # THE VIP PASS
     api_key_param = ""
     if "GOOGLE_BOOKS_API_KEY" in st.secrets:
         api_key_param = f"&key={st.secrets['GOOGLE_BOOKS_API_KEY']}"
 
+    # THE LOCATION FIX: Force Google to recognize the request as coming from Switzerland
+    country_param = "&country=CH"
+
     # 1. TRY GOOGLE BOOKS FIRST (BY EXACT ISBN)
     for isbn in meta['isbns']:
         try:
-            url = f"{GOOGLE_BOOKS_API}{isbn}{api_key_param}"
+            # Added the country parameter here
+            url = f"{GOOGLE_BOOKS_API}{isbn}{api_key_param}{country_param}"
             response = http_session.get(url, timeout=5)
             
             if response.status_code == 200:
@@ -219,20 +224,18 @@ def get_complete_book_info(item_id, id_to_metadata, http_session):
                     
                     if book_data["cover"] != PLACEHOLDER_COVER and book_data["summary"] != "No summary available.":
                         break
-            else:
-                # DEBUG LINE: Print exactly why Google rejected it
-                st.error(f"Google API Error (ISBN): {response.status_code} - {response.text}")
-        except Exception as e:
+        except Exception:
             pass 
 
-    # 2. TRY GOOGLE BOOKS BY TITLE + AUTHOR
+    # 2. THE NEW TRICK: TRY GOOGLE BOOKS BY TITLE + AUTHOR
     if book_data["summary"] == "No summary available." or book_data["cover"] == PLACEHOLDER_COVER:
         try:
             import urllib.parse
             safe_title = urllib.parse.quote_plus(book_data['title'])
             safe_author = urllib.parse.quote_plus(book_data['author'])
             
-            fallback_url = f"https://www.googleapis.com/books/v1/volumes?q=intitle:{safe_title}+inauthor:{safe_author}{api_key_param}"
+            # Added the country parameter here as well
+            fallback_url = f"https://www.googleapis.com/books/v1/volumes?q=intitle:{safe_title}+inauthor:{safe_author}{api_key_param}{country_param}"
             response = http_session.get(fallback_url, timeout=5)
             
             if response.status_code == 200:
@@ -249,13 +252,10 @@ def get_complete_book_info(item_id, id_to_metadata, http_session):
                         g_summary = info.get("description")
                         if g_summary:
                             book_data["summary"] = g_summary
-            else:
-                 # DEBUG LINE: Print exactly why Google rejected it
-                 st.error(f"Google API Error (Title): {response.status_code} - {response.text}")
-        except Exception as e:
+        except Exception:
             pass
             
-    # 3. SECOND CHANCE: OPEN LIBRARY
+    # 3. SECOND CHANCE: OPEN LIBRARY (For Cover AND Summary)
     if book_data["cover"] == PLACEHOLDER_COVER or book_data["summary"] == "No summary available.":
         for isbn in meta['isbns']:
             if book_data["cover"] == PLACEHOLDER_COVER:
@@ -264,7 +264,7 @@ def get_complete_book_info(item_id, id_to_metadata, http_session):
                     ol_response = http_session.get(open_library_cover, timeout=3, allow_redirects=True, stream=True)
                     if ol_response.status_code == 200:
                         book_data["cover"] = open_library_cover
-                except:
+                except Exception:
                     pass
 
             if book_data["summary"] == "No summary available.":
@@ -282,7 +282,7 @@ def get_complete_book_info(item_id, id_to_metadata, http_session):
                                     book_data["summary"] = desc["value"]
                                 elif isinstance(desc, str):
                                     book_data["summary"] = desc
-                except:
+                except Exception:
                     pass
             
             if book_data["cover"] != PLACEHOLDER_COVER and book_data["summary"] != "No summary available.":
