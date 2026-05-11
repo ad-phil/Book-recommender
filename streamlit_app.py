@@ -1,11 +1,14 @@
+
 import streamlit as st
 import requests
 import pandas as pd
 import re
-import time
 import os
+import concurrent.futures
+import base64
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from datetime import datetime
 
 # --- 1. CONFIG & STATE ---
 st.set_page_config(page_title="BCU Lausanne", layout="wide", initial_sidebar_state="collapsed")
@@ -131,46 +134,58 @@ def load_data_csv(file_path):
         st.error(f"Error loading {file_path}: {e}")
         return pd.DataFrame()
 
-# OPTIMIZATION: Only parse the catalog for the IDs we actually need
 def build_targeted_catalog(items_df, required_ids):
     id_to_metadata = {}
-
     if items_df.empty or not required_ids:
         return id_to_metadata
 
     items_df.columns = items_df.columns.str.strip()
     id_col = 'i' if 'i' in items_df.columns else items_df.columns[0]
-
-    # Filter the entire dataframe down to JUST the rows we need before running heavy loops
     filtered_df = items_df[items_df[id_col].astype(str).str.strip().isin(required_ids)]
+    records = filtered_df.to_dict('records')
 
-    for _, row in filtered_df.iterrows():
+    def safe_get(row, primary_col, fallback_col=None):
+        val = row.get(primary_col)
+        if pd.isna(val) or str(val).lower() == 'nan' or str(val).strip() == '':
+            if fallback_col:
+                val = row.get(fallback_col)
+                if pd.isna(val) or str(val).lower() == 'nan' or str(val).strip() == '':
+                    return None
+            else:
+                return None
+        return str(val).strip()
+
+    for row in records:
         item_id = str(row[id_col]).strip()
         
-        title = row.get('Title', 'Unknown Title')
-        if pd.isna(title) or str(title).lower() == 'nan': 
-            title = 'Unknown Title'
-        else:
-            title = str(title).rstrip(' /')
+        title = safe_get(row, 'Title', 'api_title') or 'Unknown Title'
+        title = title.rstrip(' /')
 
-        author = row.get('Author', 'Unknown Author')
-        if pd.isna(author) or str(author).lower() == 'nan': 
-            author = 'Unknown Author'
-        else:
-            author = str(author)
-            author = re.sub(r'\s*\d.*$', '', author)
-            author = author.replace(',', '')
-            author = " ".join(author.split())
-            author = author.rstrip(' (-.,)')
+        author = safe_get(row, 'Author', 'api_authors') or 'Unknown Author'
+        author = re.sub(r'\s*\d.*$', '', author).replace(',', '')
+        author = " ".join(author.split()).rstrip(' (-.,)')
 
-        raw_isbns = row.get('ISBN Valid')
+        summary = safe_get(row, 'api_description', 'description_x') or "No summary available."
+        cover = safe_get(row, 'api_thumbnail') or PLACEHOLDER_COVER
+        
+        year = safe_get(row, 'api_published_date')
+        if year: year = year[:4] 
+        else: year = "Unknown"
+            
+        publisher = safe_get(row, 'Publisher', 'api_publisher') or "BCU Library"
+
+        raw_isbns = row.get('isbn_clean') or row.get('first_isbn') or row.get('ISBN Valid')
         valid_isbns = []
         if not pd.isna(raw_isbns) and str(raw_isbns).lower() != 'nan':
             valid_isbns = [re.sub(r'\D', '', isbn) for isbn in str(raw_isbns).split(';') if re.sub(r'\D', '', isbn)]
 
         id_to_metadata[item_id] = {
-            'title': title,
-            'author': author,
+            'title': title, 
+            'author': author, 
+            'summary': summary,
+            'cover': cover,
+            'year': year,
+            'publisher': publisher,
             'isbns': valid_isbns
         }
 
@@ -178,31 +193,29 @@ def build_targeted_catalog(items_df, required_ids):
 
 def get_complete_book_info(item_id, id_to_metadata, http_session):
     item_id = str(item_id).strip()
-    
-    if item_id not in id_to_metadata:
-        return None 
-
+    if item_id not in id_to_metadata: return None 
     meta = id_to_metadata[item_id]
 
     book_data = {
-        "title": meta['title'],
-        "author": meta['author'],
-        "cover": PLACEHOLDER_COVER,
-        "summary": "No summary available.",
-        "item_id": item_id
+        "title": meta['title'], 
+        "author": meta['author'], 
+        "cover": meta['cover'], 
+        "summary": meta['summary'], 
+        "item_id": item_id, 
+        "year": meta['year'], 
+        "publisher": meta['publisher']
     }
-
-    api_key_param = ""
-    if "GOOGLE_BOOKS_API_KEY" in st.secrets:
-        api_key_param = f"&key={st.secrets['GOOGLE_BOOKS_API_KEY']}"
-
+    
+    if book_data["cover"] != PLACEHOLDER_COVER and book_data["summary"] != "No summary available.":
+        return book_data
+    
+    api_key_param = f"&key={st.secrets['GOOGLE_BOOKS_API_KEY']}" if "GOOGLE_BOOKS_API_KEY" in st.secrets else ""
     country_param = "&country=CH"
 
     for isbn in meta['isbns']:
         try:
             url = f"{GOOGLE_BOOKS_API}{isbn}{api_key_param}{country_param}"
-            response = http_session.get(url, timeout=5)
-            
+            response = http_session.get(url, timeout=4)
             if response.status_code == 200:
                 data = response.json()
                 if "items" in data and len(data["items"]) > 0:
@@ -210,44 +223,38 @@ def get_complete_book_info(item_id, id_to_metadata, http_session):
                     
                     if book_data["cover"] == PLACEHOLDER_COVER:
                         g_cover = info.get("imageLinks", {}).get("thumbnail")
-                        if g_cover:
-                            book_data["cover"] = g_cover.replace("http:", "https:")
-
+                        if g_cover: book_data["cover"] = g_cover.replace("http:", "https:")
+                    
                     if book_data["summary"] == "No summary available.":
                         g_summary = info.get("description")
-                        if g_summary:
-                            book_data["summary"] = g_summary
-                    
-                    if book_data["cover"] != PLACEHOLDER_COVER and book_data["summary"] != "No summary available.":
-                        break
-        except Exception:
-            pass 
+                        if g_summary: book_data["summary"] = g_summary
+                        
+                    if book_data["year"] == "Unknown" and "publishedDate" in info:
+                        book_data["year"] = info["publishedDate"][:4]
+                    if book_data["publisher"] == "BCU Library" and "publisher" in info:
+                        book_data["publisher"] = info["publisher"]
+                        
+                    if book_data["cover"] != PLACEHOLDER_COVER and book_data["summary"] != "No summary available.": break
+        except Exception: pass 
 
     if book_data["summary"] == "No summary available." or book_data["cover"] == PLACEHOLDER_COVER:
         try:
             import urllib.parse
             safe_title = urllib.parse.quote_plus(book_data['title'])
             safe_author = urllib.parse.quote_plus(book_data['author'])
-            
             fallback_url = f"https://www.googleapis.com/books/v1/volumes?q=intitle:{safe_title}+inauthor:{safe_author}{api_key_param}{country_param}"
-            response = http_session.get(fallback_url, timeout=5)
-            
+            response = http_session.get(fallback_url, timeout=4)
             if response.status_code == 200:
                 data = response.json()
                 if "items" in data and len(data["items"]) > 0:
                     info = data["items"][0]["volumeInfo"]
-                    
                     if book_data["cover"] == PLACEHOLDER_COVER:
                         g_cover = info.get("imageLinks", {}).get("thumbnail")
-                        if g_cover:
-                            book_data["cover"] = g_cover.replace("http:", "https:")
-
+                        if g_cover: book_data["cover"] = g_cover.replace("http:", "https:")
                     if book_data["summary"] == "No summary available.":
                         g_summary = info.get("description")
-                        if g_summary:
-                            book_data["summary"] = g_summary
-        except Exception:
-            pass
+                        if g_summary: book_data["summary"] = g_summary
+        except Exception: pass
             
     if book_data["cover"] == PLACEHOLDER_COVER or book_data["summary"] == "No summary available.":
         for isbn in meta['isbns']:
@@ -255,15 +262,14 @@ def get_complete_book_info(item_id, id_to_metadata, http_session):
                 open_library_cover = f"https://covers.openlibrary.org/b/isbn/{isbn}-L.jpg?default=false"
                 try:
                     ol_response = http_session.get(open_library_cover, timeout=3, allow_redirects=True, stream=True)
-                    if ol_response.status_code == 200:
+                    if ol_response.status_code == 200: 
                         book_data["cover"] = open_library_cover
-                except Exception:
-                    pass
+                except Exception: pass
 
             if book_data["summary"] == "No summary available.":
                 open_library_data = f"https://openlibrary.org/api/books?bibkeys=ISBN:{isbn}&jscmd=details&format=json"
                 try:
-                    ol_desc_response = http_session.get(open_library_data, timeout=4)
+                    ol_desc_response = http_session.get(open_library_data, timeout=3)
                     if ol_desc_response.status_code == 200:
                         ol_json = ol_desc_response.json()
                         key = f"ISBN:{isbn}"
@@ -271,16 +277,12 @@ def get_complete_book_info(item_id, id_to_metadata, http_session):
                             details = ol_json[key]["details"]
                             if "description" in details:
                                 desc = details["description"]
-                                if isinstance(desc, dict) and "value" in desc:
-                                    book_data["summary"] = desc["value"]
-                                elif isinstance(desc, str):
-                                    book_data["summary"] = desc
-                except Exception:
-                    pass
-            
-            if book_data["cover"] != PLACEHOLDER_COVER and book_data["summary"] != "No summary available.":
-                break
-
+                                if isinstance(desc, dict) and "value" in desc: book_data["summary"] = desc["value"]
+                                elif isinstance(desc, str): book_data["summary"] = desc
+                except Exception: pass
+                
+            if book_data["cover"] != PLACEHOLDER_COVER and book_data["summary"] != "No summary available.": break
+                
     return book_data
 
 def get_user_zero_fallback_blocks(recommendations_df):
@@ -293,12 +295,10 @@ def get_user_zero_fallback_blocks(recommendations_df):
     raw_id_data = " ".join(zero_recs['isbn'].astype(str).tolist())
     return [block.strip() for block in raw_id_data.split() if block.strip()]
 
-
 @st.cache_data(show_spinner=False)
 def fetch_book_data_v2(item_id_blocks, _id_to_metadata, fallback_blocks=None): 
     books_results = []
     fallback_blocks = fallback_blocks or []
-    fallback_index = 0
     seen_ids = set()
     
     http_session = requests.Session()
@@ -307,92 +307,149 @@ def fetch_book_data_v2(item_id_blocks, _id_to_metadata, fallback_blocks=None):
         "Accept": "application/json, text/plain, */*"
     })
     
-    retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
-    adapter = HTTPAdapter(max_retries=retries)
+    retries = Retry(total=2, backoff_factor=0.3, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=retries)
     http_session.mount('http://', adapter)
     http_session.mount('https://', adapter)
 
-    for block in item_id_blocks:
+    def fetch_block(block):
         ids_for_this_book = [i.strip() for i in block.split(';') if i.strip()]
-        details = None
-        
         for item_id in ids_for_this_book:
             details = get_complete_book_info(item_id, _id_to_metadata, http_session)
-            
             if details is not None:
-                if details["item_id"] not in seen_ids:
-                    break
-                else:
-                    details = None
-                
-        if details is None and fallback_blocks:
-            while fallback_index < len(fallback_blocks):
-                fallback_block = fallback_blocks[fallback_index]
-                fallback_index += 1
-                
-                fallback_ids_for_this_book = [i.strip() for i in fallback_block.split(';') if i.strip()]
-                for f_id in fallback_ids_for_this_book:
-                    temp_fallback_details = get_complete_book_info(f_id, _id_to_metadata, http_session)
-                    
-                    if temp_fallback_details is not None:
-                        if temp_fallback_details["item_id"] not in seen_ids:
-                            details = temp_fallback_details
-                            break
-                
-                if details is not None:
-                    break
+                return details, ids_for_this_book[0] if ids_for_this_book else "Unknown"
+        return None, ids_for_this_book[0] if ids_for_this_book else "Unknown"
 
-        if details is None:
-            first_id = ids_for_this_book[0] if ids_for_this_book else "Unknown"
-            details = {
-                "title": f"Not Found (ID: {first_id})", 
-                "author": "Unknown", 
-                "cover": PLACEHOLDER_COVER, 
-                "summary": "This book ID is missing from items.csv."
-            }
-            
-        books_results.append(details)
-        
-        if "item_id" in details:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        primary_results = list(executor.map(fetch_block, item_id_blocks))
+
+    fallback_index = 0
+    
+    for details, first_id in primary_results:
+        if details is not None and details["item_id"] not in seen_ids:
+            books_results.append(details)
             seen_ids.add(details["item_id"])
+        else:
+            resolved_details = None
+            while fallback_index < len(fallback_blocks):
+                f_block = fallback_blocks[fallback_index]
+                fallback_index += 1
+                f_details, _ = fetch_block(f_block)
+                if f_details is not None and f_details["item_id"] not in seen_ids:
+                    resolved_details = f_details
+                    break
             
-         
-        
+            if resolved_details is not None:
+                books_results.append(resolved_details)
+                seen_ids.add(resolved_details["item_id"])
+            else:
+                books_results.append({
+                    "title": f"Not Found (ID: {first_id})", 
+                    "author": "Unknown", 
+                    "cover": PLACEHOLDER_COVER, 
+                    "summary": "This book ID is missing from items.csv."
+                })
+                
     return books_results
+
+# --- SVG COVER GENERATOR ---
+def make_svg_cover(title, author):
+    # Clean text to prevent breaking XML layout
+    title = title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    author = author.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    
+    palettes = [
+        ("#1a1a2e", "#e94560", "#ffffff"),
+        ("#2d2d2d", "#f4a261", "#ffffff"),
+        ("#0f3460", "#533483", "#e8e8e8"),
+        ("#1b4332", "#52b788", "#ffffff"),
+        ("#370617", "#f48c06", "#ffffff"),
+        ("#4a4e69", "#c9ada7", "#f2e9e4"),
+        ("#03045e", "#00b4d8", "#ffffff"),
+        ("#6b2d8b", "#f72585", "#ffffff"),
+    ]
+    idx = abs(hash(title)) % len(palettes)
+    bg, accent, text_color = palettes[idx]
+
+    def wrap_text(text, max_chars=18):
+        words = text.split()
+        lines, current = [], ""
+        for word in words:
+            if len(current) + len(word) + 1 <= max_chars:
+                current = (current + " " + word).strip()
+            else:
+                if current: lines.append(current)
+                current = word
+        if current: lines.append(current)
+        return lines[:4]
+
+    title_lines = wrap_text(title, 16)
+    author_lines = wrap_text(author, 20)
+
+    title_y_start = 110 - (len(title_lines) - 1) * 14
+    title_spans = ""
+    for i, line in enumerate(title_lines):
+        y = title_y_start + i * 28
+        title_spans += f'<tspan x="100" dy="0" y="{y}">{line}</tspan>'
+
+    author_y = title_y_start + len(title_lines) * 28 + 20
+    author_spans = ""
+    for i, line in enumerate(author_lines):
+        y = author_y + i * 18
+        author_spans += f'<tspan x="100" dy="0" y="{y}">{line}</tspan>'
+
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 300" width="200" height="300">
+  <defs>
+    <pattern id="grid_{idx}" width="20" height="20" patternUnits="userSpaceOnUse">
+      <path d="M 20 0 L 0 0 0 20" fill="none" stroke="{accent}" stroke-width="0.3" opacity="0.3"/>
+    </pattern>
+  </defs>
+  <rect width="200" height="300" fill="{bg}"/>
+  <rect width="200" height="300" fill="url(#grid_{idx})"/>
+  <rect x="0" y="0" width="8" height="300" fill="{accent}"/>
+  <rect x="0" y="230" width="200" height="70" fill="{accent}" opacity="0.15"/>
+  <circle cx="160" cy="50" r="40" fill="{accent}" opacity="0.12"/>
+  <circle cx="170" cy="60" r="25" fill="{accent}" opacity="0.1"/>
+  <text font-family="Georgia, serif" font-size="17" font-weight="bold" fill="{text_color}" text-anchor="middle" dominant-baseline="middle">
+    {title_spans}
+  </text>
+  <line x1="20" y1="{author_y - 10}" x2="180" y2="{author_y - 10}" stroke="{accent}" stroke-width="1" opacity="0.6"/>
+  <text font-family="Georgia, serif" font-size="12" font-style="italic" fill="{accent}" text-anchor="middle" dominant-baseline="middle">
+    {author_spans}
+  </text>
+  <text x="20" y="285" font-family="monospace" font-size="7" fill="{text_color}" opacity="0.4">BCU LAUSANNE</text>
+</svg>"""
+
+    svg_b64 = base64.b64encode(svg.encode('utf-8')).decode('utf-8')
+    return f"data:image/svg+xml;base64,{svg_b64}"
 
 # --- HELPER: UI RENDERING FOR BOOK CARD ---
 def render_book_card(book, rank):
-    
     t_len = len(book["title"])
     if t_len < 35: fs = "16px"
     elif t_len < 60: fs = "14px"
-    elif t_len < 85: fs = "12px"
-    else: fs = "11px"
+    elif t_len < 85: fs = "11px"
+    elif t_len < 120: fs = "9px"
+    else: fs = "6px"
     
     st.markdown(f'<div class="book-title-box" style="font-size: {fs};">{book["title"]}</div>', unsafe_allow_html=True)
     
-    badge_html = f'<div style="position: absolute; top: -15px; left: -15px; background-color: #dedbd0; color: {BURGUNDY}; width: 35px; height: 35px; border-radius: 50%; display: flex; justify-content: center; align-items: center; font-weight: 900; font-size: 18px; box-shadow: 0 4px 8px rgba(0,0,0,0.3); z-index: 10; border: 2px solid white;">{rank}</div>'
+    badge_html = f'<div style="position: absolute; top: -15px; left: -15px; background-color: #dedbd0; color: {BURGUNDY}; width: 35px; height: 45px; border-radius: 50%; display: flex; justify-content: center; align-items: center; font-weight: 900; font-size: 18px; box-shadow: 0 4px 8px rgba(0,0,0,0.3); z-index: 10; border: 2px solid white;">{rank}</div>'
 
-    if book['cover'] == PLACEHOLDER_COVER:
-        html_cover = f"""
-<div style="height: 220px; width: 100%; background-color: #9e1041; border-radius: 4px 12px 12px 4px; box-shadow: inset 4px 0 10px rgba(0,0,0,0.2), 0 4px 8px rgba(0,0,0,0.15); display: flex; flex-direction: column; justify-content: center; align-items: center; padding: 15px; margin-bottom: 10px; text-align: center; position: relative; border-left: 5px solid #7a0c32;">
-{badge_html}
-<div style="color: white; font-weight: bold; font-size: 14px; margin-bottom: 10px; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden;">{book['title']}</div>
-<div style="color: #e0e0e0; font-size: 12px; font-style: italic;">{book['author']}</div>
-<div style="position: absolute; bottom: 10px; right: 10px; opacity: 0.3;">
-<svg width="24" height="24" viewBox="0 0 24 24" fill="white"><path d="M4 19v-14c0-1.1.9-2 2-2h12c1.1 0 2 .9 2 2v14l-4-2-4 2-4-2-4 2zm2-14v11.5l2-1 2 1 2-1 2 1 2-1 2 1v-11.5h-12z"/></svg>
-</div>
-</div>
-"""
-        st.markdown(html_cover, unsafe_allow_html=True)
-    else:
-        html_cover = f"""
-<div style="height: 220px; position: relative; display: flex; justify-content: center; align-items: center; margin-bottom: 10px;">
-{badge_html}
-<img src="{book['cover']}" style="max-height: 100%; max-width: 100%; object-fit: contain; box-shadow: 0 4px 8px rgba(0,0,0,0.15);">
-</div>
-"""
-        st.markdown(html_cover, unsafe_allow_html=True)
+    # Build the fallback SVG
+    svg_fallback = make_svg_cover(book['title'], book.get('author', 'Unknown'))
+    
+    # Determine which image source to try first
+    img_src = book['cover'] if book['cover'] != PLACEHOLDER_COVER else svg_fallback
+
+    # The onerror handles broken external links dynamically
+    html_cover = f"""
+    <div style="height: 220px; position: relative; display: flex; justify-content: center; align-items: center; margin-bottom: 10px;">
+    {badge_html}
+    <img src="{img_src}" style="max-height: 100%; max-width: 100%; object-fit: contain; box-shadow: 0 4px 8px rgba(0,0,0,0.15);" onerror="this.onerror=null; this.src='{svg_fallback}';">
+    </div>
+    """
+    st.markdown(html_cover, unsafe_allow_html=True)
         
     st.markdown(f'<div class="book-author-box"> {book.get("author", "Unknown Author")}</div>', unsafe_allow_html=True)
     with st.expander("Book summary"):
@@ -558,9 +615,8 @@ else:
 
     with st.container(border=False):
         with st.spinner("Loading your personalized library view..."):
-            # Load Dataframes from Cache
             recs_df = load_data_csv("recommendations_2.csv")
-            items_df = load_data_csv("items.csv") 
+            items_df = load_data_csv("items_enriched_api.csv") 
             interactions_df = load_data_csv("interactions_train.csv")
             
             if items_df.empty:
@@ -569,10 +625,8 @@ else:
             
             uid_entered = str(st.session_state.user_id).strip()
             
-            # --- EXTRACT ONLY NECESSARY IDs ---
             required_ids = set()
             
-            # 1. Recommendation IDs
             user_recs = recs_df[recs_df['user_id'] == uid_entered] if not recs_df.empty else pd.DataFrame()
             new_recs = recs_df[recs_df['user_id'] == 'new'] if not recs_df.empty else pd.DataFrame()
             fallback_blocks = get_user_zero_fallback_blocks(recs_df)
@@ -602,23 +656,31 @@ else:
             add_block_ids_to_set(new_blocks)
             add_block_ids_to_set(fallback_blocks)
 
-            # 2. History IDs
             user_hist_df = pd.DataFrame()
             if not interactions_df.empty and 'u' in interactions_df.columns and uid_entered != 'new':
                 user_hist_df = interactions_df[interactions_df['u'] == uid_entered]
                 if not user_hist_df.empty:
                     required_ids.update(user_hist_df['i'].astype(str).str.strip().tolist())
 
-            # --- BUILD CATALOG ONLY FOR EXTRACTED IDs ---
             id_to_metadata = build_targeted_catalog(items_df, required_ids)
             
-        # Build User History HTML block if applicable
         history_html = ""
         if not user_hist_df.empty:
             hist_items = []
-            for _, row in user_hist_df.iterrows():
+            for row in user_hist_df.to_dict('records'):
                 hist_iid = str(row.get('i', '')).strip()
-                hist_date = str(row.get('t', 'Unknown Date')).strip()
+                raw_date = str(row.get('t', '')).strip()
+                
+                try:
+                    ts = int(float(raw_date))
+                    if ts > 1e11:
+                        dt = pd.to_datetime(ts, unit='ms')
+                    else:
+                        dt = pd.to_datetime(ts, unit='s')
+                    hist_date = dt.strftime('%d/%m/%y %H:%M')
+                except (ValueError, TypeError):
+                    hist_date = raw_date
+                
                 meta = id_to_metadata.get(hist_iid, {'title': 'Unknown Title', 'author': 'Unknown Author'})
                 
                 hist_items.append(f"""
@@ -646,7 +708,6 @@ else:
                 books_user = fetch_book_data_v2(user_blocks, id_to_metadata, fallback_blocks=fallback_blocks) if user_blocks else []
                 books_new = fetch_book_data_v2(new_blocks, id_to_metadata, fallback_blocks=fallback_blocks) if new_blocks else []
                 
-                # Check if we should render layout with left history column
                 if history_html and uid_entered != 'new':
                     col_hist, col_main = st.columns([1, 2.8])
                     
@@ -659,7 +720,6 @@ else:
                         if books_new and uid_entered != 'new':
                             display_netflix_row("Top 10 Library Recommendations", books_new, "new_row")
                 else:
-                    # Standard Layout without history
                     if books_user:
                         row_title = "Trending Picks" if uid_entered == 'new' else f"Recommended for You"
                         display_netflix_row(row_title, books_user, "user_row")
